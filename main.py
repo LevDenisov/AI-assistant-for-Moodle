@@ -14,6 +14,9 @@ from PIL import Image, ImageDraw
 import sqlite3
 from contextlib import closing
 
+from flask import Flask, request, jsonify
+import threading
+
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -25,6 +28,9 @@ DEFAULT_API_KEY = os.getenv("AI_API_KEY", "")
 DB_PATH = os.getenv("APP_DB_PATH", "mvp_state.db")
 REQUEST_TIMEOUT = 60
 UPLOAD_DIR = os.getenv("APP_UPLOAD_DIR", "uploads")
+LLM_API_URL = os.getenv("LLM_API_URL", "http://llm-host:8000")
+PUBLIC_CALLBACK_BASE = os.getenv("PUBLIC_CALLBACK_BASE", "http://your-host:8008")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8008"))
 
 # ----------------------------- БД ---------------------------------------
 def _db():
@@ -70,6 +76,18 @@ def init_db():
                 FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_jobs(
+                submission_id TEXT PRIMARY KEY,
+                task_id       TEXT NOT NULL,
+                status        TEXT NOT NULL,           -- queued|processing|done|error
+                external_id   TEXT,
+                result_json   TEXT,
+                created       INTEGER NOT NULL,
+                updated       INTEGER NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            )
+        """)
 
 def load_state_from_db():
     with closing(_db()) as conn:
@@ -91,6 +109,69 @@ def load_state_from_db():
             r[0]: {"criteria": json.loads(r[1]), "total": r[2], "updated": r[3]}
             for r in cur.fetchall()
         }
+        # review_jobs -> dict
+        cur = conn.execute("SELECT submission_id, task_id, status, external_id, result_json, created, updated FROM review_jobs")
+        st.session_state.review_jobs = {
+            r[0]: {
+                "task_id": r[1], "status": r[2], "external_id": r[3],
+                "result_json": json.loads(r[4]) if r[4] else None,
+                "created": r[5], "updated": r[6]
+            }
+            for r in cur.fetchall()
+        }
+
+def refresh_jobs_and_results():
+    """Лёгкий рефреш только review_jobs и results из БД, чтобы подхватывать вебхук."""
+    with closing(_db()) as conn:
+        # review_jobs
+        cur = conn.execute(
+            "SELECT submission_id, task_id, status, external_id, result_json, created, updated FROM review_jobs"
+        )
+        st.session_state.review_jobs = {
+            r[0]: {
+                "task_id": r[1],
+                "status": r[2],
+                "external_id": r[3],
+                "result_json": json.loads(r[4]) if r[4] else None,
+                "created": r[5],
+                "updated": r[6],
+            }
+            for r in cur.fetchall()
+        }
+
+        # results
+        cur = conn.execute("SELECT task_id, json FROM results")
+        st.session_state.results = {r[0]: json.loads(r[1]) for r in cur.fetchall()}
+
+
+def _start_webhook_server_once():
+    if st.session_state.get("_webhook_started"):
+        return
+    app = Flask("llm-callback-server")
+
+    @app.post("/callback")
+    def callback():
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+            submission_id = data.get("submission_id")
+            task_id = data.get("task_id")
+            result = data.get("result")  # ожидаем JSON результата в том же формате, что и сейчас в results
+            if not submission_id or not task_id or not isinstance(result, dict):
+                return jsonify({"ok": False, "error": "bad payload"}), 400
+
+            set_job_result(submission_id, task_id, result)
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    def _run():
+        app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
+
+    threading.Thread(target=_run, daemon=True).start()
+    st.session_state["_webhook_started"] = True
+
+# запускаем вебхук при старте приложения
+_start_webhook_server_once()
 
 def persist_task(task: Dict[str, Any]):
     with closing(_db()) as conn, conn:
@@ -136,6 +217,26 @@ def persist_submission(task_id: str, payload: Dict[str, Any]):
             )
         )
 
+def persist_review_job(submission_id: str, task_id: str, status: str="queued", external_id: Optional[str]=None, result: Optional[Dict[str, Any]]=None):
+    with closing(_db()) as conn, conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO review_jobs(submission_id, task_id, status, external_id, result_json, created, updated)
+               VALUES(?,?,?,?,?,
+                      COALESCE((SELECT created FROM review_jobs WHERE submission_id=?), ?),
+                      ?)""",
+            (
+                submission_id, task_id, status, external_id,
+                json.dumps(result, ensure_ascii=False) if result else None,
+                submission_id, int(time.time()), int(time.time())
+            )
+        )
+
+def set_job_result(submission_id: str, task_id: str, result: Dict[str, Any]):
+    # сохраняем как обычный результат (в твою таблицу results) + отмечаем джобу
+    persist_result(task_id, result)
+    persist_review_job(submission_id, task_id, status="done", result=result)
+
+
 # ----------------------------- Состояние ---------------------------------------
 if "tasks" not in st.session_state:
     st.session_state.tasks: List[Dict[str, Any]] = []
@@ -151,6 +252,8 @@ if "confirm_delete_task" not in st.session_state:
     st.session_state.confirm_delete_task = None
 if "teacher_reviews" not in st.session_state:
     st.session_state.teacher_reviews: Dict[str, Dict[str, Any]] = {}
+if "review_jobs" not in st.session_state:
+    st.session_state.review_jobs: Dict[str, Dict[str, Any]] = {}
 
 # Инициализируем БД и (при первом запуске) загружаем состояние из неё
 if "db_initialized" not in st.session_state:
@@ -273,6 +376,18 @@ def mock_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ----------------------------- UI ---------------------------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
+refresh_jobs_and_results()
+
+# Автообновление, если есть активные задания
+has_active = any(j["status"] in ("queued", "processing") for j in st.session_state.get("review_jobs", {}).values())
+if has_active:
+    # каждые 3 секунды
+    st.experimental_set_query_params(_=int(time.time()))  # чтобы не кэшировалось
+    st.markdown(
+        "<script>setTimeout(()=>window.location.reload(),3000);</script>",
+        unsafe_allow_html=True
+    )
+
 
 with st.sidebar:
     st.header("Настройки")
@@ -404,37 +519,112 @@ for task in st.session_state.tasks:
 
                     # вызов API/мок
                     if mode == "API":
-                        if not api_base:
-                            st.error("Укажите API base URL или переключитесь в режим Мок")
-                            st.stop()
-                        data, err = call_orchestrator(api_base, api_key, payload)
-                        if err:
-                            st.error(f"Ошибка API: {err}")
-                            st.stop()
+                        # 1) фиксируем submission локально (как и в синхронной ветке)
+                        if input_mode == "Текст":
+                            sub = {"mode": "text", "text": (sol_text or "").strip(), "file_path": None, "file_name": None}
+                        else:
+                            ts = int(time.time())
+                            fname = uploaded.name
+                            safe_name = f"{task['id']}_{ts}_{fname}"
+                            path = os.path.join(UPLOAD_DIR, safe_name)
+                            with open(path, "wb") as out:
+                                out.write(uploaded.getbuffer())
+                            sub = {"mode": "file", "text": None, "file_path": path, "file_name": fname}
+
+                        st.session_state.submissions[task["id"]] = sub
+                        persist_submission(task["id"], sub)
+
+                        # 2) регистрируем job и зовём внешний LLM
+                        submission_id = f"{task['id']}-submission"
+                        persist_review_job(submission_id, task["id"], status="queued")
+
+                        # локально сразу обновим память — чтобы баннер и авто-обновление включились мгновенно
+                        st.session_state.review_jobs[submission_id] = {
+                            "task_id": task["id"],
+                            "status": "queued",
+                            "external_id": None,
+                            "result_json": None,
+                            "created": int(time.time()),
+                            "updated": int(time.time()),
+                        }
+
+                        payload = {
+                            "submission_id": submission_id,
+                            "task_id": task["id"],
+                            "task_text": task.get("condition", ""),
+                            "mode": "text" if input_mode == "Текст" else "file",
+                            "text": (sol_text or "").strip() if input_mode == "Текст" else "",
+                            "file_url": None,  # при нужде отдай сюда URL файла
+                            "callback_url": PUBLIC_CALLBACK_BASE.rstrip("/") + "/callback",
+                        }
+
+                        try:
+                            if not LLM_API_URL:
+                                st.error("Не задан LLM_API_URL")
+                                st.stop()
+                            if not PUBLIC_CALLBACK_BASE:
+                                st.error("Не задан PUBLIC_CALLBACK_BASE")
+                                st.stop()
+                            llm_api = LLM_API_URL.rstrip("/") + "/reviews/async"
+                            resp = requests.post(llm_api, json=payload, timeout=REQUEST_TIMEOUT)
+                            if resp.status_code >= 400:
+                                st.error(f"LLM API error: {resp.status_code} {resp.text[:200]}")
+                                persist_review_job(submission_id, task["id"], status="error")
+                            else:
+                                data = resp.json()
+                                new_status = data.get("status", "processing")
+                                ext_id = data.get("id")
+                                persist_review_job(submission_id, task["id"], status=new_status, external_id=ext_id)
+
+                                # Сразу обновим память
+                                st.session_state.review_jobs[submission_id].update({
+                                    "status": new_status,
+                                    "external_id": ext_id,
+                                    "updated": int(time.time()),
+                                })
+                        except Exception as e:
+                            st.error(f"Ошибка вызова LLM: {e}")
+                            persist_review_job(submission_id, task["id"], status="error")
+                            st.session_state.review_jobs[submission_id]["status"] = "error"
+                            st.session_state.review_jobs[submission_id]["updated"] = int(time.time())
+
+                        st.success("Решение отправлено на проверку. Как только LLM закончит, результат появится автоматически.")
+                        st.rerun()
                     else:
-                        data = mock_response(payload)
+                        # синхронный МОК как и раньше
+                        data = mock_response({
+                            "submission_id": f"{task['id']}-submission",
+                            "task": task.get("condition", ""),
+                            "text": (sol_text or "").strip() if input_mode == "Текст" else "",
+                        })
+                        st.session_state.results[task['id']] = data
+                        persist_result(task['id'], data)
 
-                    # сохраняем результат анализа
-                    st.session_state.results[task['id']] = data
-                    persist_result(task['id'], data)
+                        # фиксируем submission (для мок-ветки)
+                        if input_mode == "Текст":
+                            sub = {"mode": "text", "text": (sol_text or "").strip(), "file_path": None, "file_name": None}
+                        else:
+                            ts = int(time.time())
+                            fname = uploaded.name
+                            safe_name = f"{task['id']}_{ts}_{fname}"
+                            path = os.path.join(UPLOAD_DIR, safe_name)
+                            with open(path, "wb") as out:
+                                out.write(uploaded.getbuffer())
+                            sub = {"mode": "file", "text": None, "file_path": path, "file_name": fname}
 
-                    # фиксируем submission
-                    if input_mode == "Текст":
-                        sub = {"mode": "text", "text": (sol_text or "").strip(),
-                               "file_path": None, "file_name": None}
-                    else:
-                        ts = int(time.time())
-                        fname = uploaded.name
-                        safe_name = f"{task['id']}_{ts}_{fname}"
-                        path = os.path.join(UPLOAD_DIR, safe_name)
-                        with open(path, "wb") as out:
-                            out.write(uploaded.getbuffer())
-                        sub = {"mode": "file", "text": None, "file_path": path, "file_name": fname}
+                        st.session_state.submissions[task["id"]] = sub
+                        persist_submission(task["id"], sub)
+                        st.success("Решение отправлено.")
+                        st.rerun()
 
-                    st.session_state.submissions[task["id"]] = sub
-                    persist_submission(task["id"], sub)
-                    st.success("Решение отправлено.")
-                    st.rerun()
+            # Статус внешней проверки
+            submission_id = f"{task['id']}-submission"
+            job = st.session_state.review_jobs.get(submission_id)
+            if job and job["status"] in ("queued", "processing"):
+                st.info("Оценка запущена на внешнем LLM. Ожидаем результат…")
+            elif job and job["status"] == "error":
+                st.error("Не удалось получить результат от LLM. Попробуйте отправить ещё раз.")
+
 
             # ── Оценка AI ───────────────────────────────────────────────────────
             data = st.session_state.results.get(task['id'])
