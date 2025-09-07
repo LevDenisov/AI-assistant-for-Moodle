@@ -28,7 +28,10 @@ REQUEST_TIMEOUT = 60
 # ----------------------------- БД ---------------------------------------
 
 def _db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
+    
+    return conn
 
 def init_db():
     with closing(_db()) as conn, conn:
@@ -66,6 +69,10 @@ def persist_task(task: Dict[str, Any]):
             (task["id"], task["condition"], int(task["created"]))
         )
 
+def delete_task(task_id: str):
+    with closing(_db()) as conn, conn:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+
 def persist_result(task_id: str, data: Dict[str, Any]):
     with closing(_db()) as conn, conn:
         conn.execute(
@@ -82,6 +89,8 @@ if "show_create" not in st.session_state:
     st.session_state.show_create = False
 if "results" not in st.session_state:
     st.session_state.results: Dict[str, Dict[str, Any]] = {}
+if "confirm_delete_task" not in st.session_state:
+    st.session_state.confirm_delete_task = None
 
 # Инициализируем БД и (при первом запуске) загружаем состояние из неё
 if "db_initialized" not in st.session_state:
@@ -125,6 +134,36 @@ def _add_task():
     # В БД
     persist_task(task)
     st.toast(f"Задание {t_id} добавлено")
+
+def render_delete_confirmation():
+    """Единый блок подтверждения удаления. Рисуется внизу страницы при установленном флаге."""
+    tid = st.session_state.get("confirm_delete_task")
+    if not tid:
+        return
+
+    with st.container(border=True):
+        st.warning(f"Удалить задание {tid}? Это действие необратимо.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Да, удалить", type="primary", key=f"confirm_yes_{tid}"):
+                # 1) БД (каскадно удалит связанный result благодаря ON DELETE CASCADE)
+                delete_task(tid)
+                # 2) Память
+                st.session_state.tasks = [t for t in st.session_state.tasks if t["id"] != tid]
+                st.session_state.results.pop(tid, None)
+                # связанные UI-ключи
+                st.session_state.pop(f"input_mode_{tid}", None)
+                st.session_state.pop(f"file_{tid}", None)
+                st.session_state.pop(f"text_{tid}", None)
+                # 3) Сброс флага и перерисовка
+                st.session_state.confirm_delete_task = None
+                st.toast(f"Задание {tid} удалено")
+                st.rerun()
+        with c2:
+            if st.button("Отмена", key=f"confirm_no_{tid}"):
+                st.session_state.confirm_delete_task = None
+                st.rerun()
+
 # ----------------------------- Утилиты -----------------------------------------
 
 def _render_pdf_pages(file_bytes: bytes, dpi: int = 150) -> List[Image.Image]:
@@ -221,8 +260,14 @@ if not st.session_state.tasks:
 
 # Рендер заданий
 for task in st.session_state.tasks:
+    render_delete_confirmation()
     with st.container(border=True):
-        st.markdown(f"**Задание №{task['id']}** — {task['condition'] or '(без описания)'}")
+        left, right = st.columns([0.8, 0.037], gap="small")
+        with left:
+            st.markdown(f"**Задание №{task['id']}** — {task['condition'] or '(без описания)'}")
+        with right:
+            if st.button("Удалить", key=f"delete_{task['id']}"):
+                st.session_state.confirm_delete_task = task["id"]
 
         # --- выбор способа сдачи (переключаемый UI) ---
         mode_key = f"input_mode_{task['id']}"
