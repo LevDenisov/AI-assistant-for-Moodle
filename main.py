@@ -11,6 +11,9 @@ import requests
 import streamlit as st
 from PIL import Image, ImageDraw
 
+import sqlite3
+from contextlib import closing
+
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -19,7 +22,56 @@ except Exception:
 APP_TITLE = "AI‑ассистент для Moodle"
 DEFAULT_API_BASE = os.getenv("AI_API_BASE_URL", "")
 DEFAULT_API_KEY = os.getenv("AI_API_KEY", "")
+DB_PATH = os.getenv("APP_DB_PATH", "mvp_state.db")
 REQUEST_TIMEOUT = 60
+
+# ----------------------------- БД ---------------------------------------
+
+def _db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db():
+    with closing(_db()) as conn, conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks(
+                id TEXT PRIMARY KEY,
+                condition TEXT NOT NULL,
+                created INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS results(
+                task_id TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                updated INTEGER NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            )
+        """)
+
+def load_state_from_db():
+    with closing(_db()) as conn:
+        cur = conn.execute("SELECT id, condition, created FROM tasks ORDER BY created ASC")
+        tasks = [
+            {"id": r[0], "condition": r[1], "created": r[2]}
+            for r in cur.fetchall()
+        ]
+        st.session_state.tasks = tasks
+        cur = conn.execute("SELECT task_id, json FROM results")
+        st.session_state.results = {r[0]: json.loads(r[1]) for r in cur.fetchall()}
+
+def persist_task(task: Dict[str, Any]):
+    with closing(_db()) as conn, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO tasks(id, condition, created) VALUES(?,?,?)",
+            (task["id"], task["condition"], int(task["created"]))
+        )
+
+def persist_result(task_id: str, data: Dict[str, Any]):
+    with closing(_db()) as conn, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO results(task_id, json, updated) VALUES(?,?,?)",
+            (task_id, json.dumps(data, ensure_ascii=False), int(time.time()))
+        )
 
 # ----------------------------- Состояние ---------------------------------------
 if "tasks" not in st.session_state:
@@ -30,6 +82,24 @@ if "show_create" not in st.session_state:
     st.session_state.show_create = False
 if "results" not in st.session_state:
     st.session_state.results: Dict[str, Dict[str, Any]] = {}
+
+# Инициализируем БД и (при первом запуске) загружаем состояние из неё
+if "db_initialized" not in st.session_state:
+    init_db()
+    load_state_from_db()  # заполняет tasks и results из БД
+    # если в БД пока пусто — ensure что структуры есть
+    st.session_state.setdefault("tasks", [])
+    st.session_state.setdefault("results", {})
+    st.session_state.db_initialized = True
+
+# task_counter синхронизируем с БД (следующее число после максимального)
+if "task_counter" not in st.session_state or st.session_state.task_counter == 1:
+    if st.session_state.tasks:
+        max_num = max(int(t["id"].replace("T", "")) for t in st.session_state.tasks)
+        st.session_state.task_counter = max_num + 1
+    else:
+        st.session_state.task_counter = 1
+
 
 # NEW: коллбэки для открытия/добавления/отмены
 def _open_create():
@@ -42,16 +112,19 @@ def _cancel_create():
 def _add_task():
     text = (st.session_state.get("new_task_text") or "").strip()
     t_id = f"T{st.session_state.task_counter:04d}"
-    st.session_state.tasks.append({
+    task = {
         "id": t_id,
         "condition": text,
         "created": int(time.time()),
-    })
+    }
+    # В память
+    st.session_state.tasks.append(task)
     st.session_state.task_counter += 1
-    # закрываем окно и чистим поле
     st.session_state.show_create = False
     st.session_state.pop("new_task_text", None)
-    st.toast(f"Задание {t_id} добавлено")   # моментальное всплывающее сообщение
+    # В БД
+    persist_task(task)
+    st.toast(f"Задание {t_id} добавлено")
 # ----------------------------- Утилиты -----------------------------------------
 
 def _render_pdf_pages(file_bytes: bytes, dpi: int = 150) -> List[Image.Image]:
@@ -146,58 +219,6 @@ if st.session_state.show_create:
 if not st.session_state.tasks:
     st.caption("Пока нет заданий — создайте первое.")
 
-# # Рендер заданий
-# for task in st.session_state.tasks:
-#     with st.container(border=True):
-#         st.markdown(f"**Задание №{task['id']}** — {task['condition'] or '(без описания)'}")
-#         # Поля для решения
-#         up_col, tx_col = st.columns([1,1])
-#         with up_col:
-#             uploaded = st.file_uploader(
-#                 f"Загрузите решение (PDF/изображение) для {task['id']}",
-#                 type=["pdf", "png", "jpg", "jpeg"],
-#                 key=f"file_{task['id']}"
-#             )
-#         with tx_col:
-#             sol_text = st.text_area(
-#                 f"Или введите текст решения для {task['id']}",
-#                 key=f"text_{task['id']}", height=140
-#             )
-
-#         # Кнопка отправки решения
-#         if st.button(f"Отправить решение для {task['id']}", key=f"send_{task['id']}"):
-#             if not uploaded and not (sol_text and sol_text.strip()):
-#                 st.error("Введите текст или загрузите файл")
-#             else:
-#                 payload = {
-#                     "submission_id": f"{task['id']}-submission",
-#                     "task": task.get("condition", ""),
-#                     "text": (sol_text or "").strip(),
-#                 }
-#                 if mode == "API":
-#                     if not api_base:
-#                         st.error("Укажите API base URL или переключитесь в режим Мок")
-#                     else:
-#                         data, err = call_orchestrator(api_base, api_key, payload)
-#                         if err:
-#                             st.error(f"Ошибка API: {err}")
-#                         else:
-#                             st.session_state.results[task['id']] = data
-#                 else:
-#                     data = mock_response(payload)
-#                     st.session_state.results[task['id']] = data
-
-#         # Вывод результата по заданию (если есть)
-#         data = st.session_state.results.get(task['id'])
-#         if data:
-#             st.markdown("**Результат анализа:**")
-#             st.text_area("Комментарий", value=data.get("comment", ""), height=160, disabled=True, key=f"out_{task['id']}")
-#             if "criteria" in data:
-#                 df = pd.DataFrame(data["criteria"])
-#                 st.dataframe(df, use_container_width=True, key=f"df_{task['id']}")
-#             if "score" in data:
-#                 st.metric("Итоговый балл", f"{data['score']}")
-
 # Рендер заданий
 for task in st.session_state.tasks:
     with st.container(border=True):
@@ -257,9 +278,11 @@ for task in st.session_state.tasks:
                             st.error(f"Ошибка API: {err}")
                         else:
                             st.session_state.results[task['id']] = data
+                            persist_result(task['id'], data)
                 else:
                     data = mock_response(payload)
                     st.session_state.results[task['id']] = data
+                    persist_result(task['id'], data)
 
         # Вывод результата по заданию (если есть)
         data = st.session_state.results.get(task['id'])
