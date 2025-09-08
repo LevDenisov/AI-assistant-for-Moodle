@@ -1,0 +1,17 @@
+services:
+  relay:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      - DATABASE_URL=sqlite:///./relay.db
+      - LLM_API_URL=http://llm:8000
+      - PUBLIC_BASE_URL=http://localhost:8080
+      - CALLBACK_HMAC_SECRET=change-me
+    volumes:
+      - ./:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+
+  # Простой заглушечный LLM для локальной отладки
+  llm:
+    image: ghcr.io/valeriansaliou/sonic:v1.4.0 # фиктивный контейнер; замените на реальный LLM
+    command: ["sleep","infinity"]
